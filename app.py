@@ -3,6 +3,7 @@ import os
 import base64
 from datetime import datetime, date, timedelta
 import json
+import sqlite3
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,27 +13,32 @@ from http import HTTPStatus
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# 页面配置必须在所有操作之前
+st.set_page_config(page_title="健康管理 · 数据导向", layout="centered")
+
 # ------------------------------------------------------------------
-# 数据库连接（优先使用 Supabase，回退到本地 SQLite）
+# 数据库连接（优先使用 DB_URI，回退到本地 SQLite）
 # ------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+# 尝试从 Streamlit Secrets 获取，如果没有则尝试本地环境变量
+try:
+    DB_URI = st.secrets.get("DB_URI", os.getenv("DB_URI", ""))
+except FileNotFoundError:
+    DB_URI = os.getenv("DB_URI", "")
 
 def get_db():
     """返回数据库连接对象（PostgreSQL 或 SQLite）"""
-    if SUPABASE_URL and SUPABASE_KEY:
+    if DB_URI:
         # PostgreSQL
-        conn = psycopg2.connect(SUPABASE_URL, sslmode='require')
+        conn = psycopg2.connect(DB_URI, sslmode='require')
         return conn
     else:
-        import sqlite3
         return sqlite3.connect("health.db")
 
 def execute_sql(sql, params=None, fetch=False):
     """统一执行 SQL，返回结果（如果有）"""
     conn = get_db()
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             # PostgreSQL 使用 RealDictCursor
             cur = conn.cursor(cursor_factory=RealDictCursor)
         else:
@@ -41,6 +47,7 @@ def execute_sql(sql, params=None, fetch=False):
             cur.execute(sql, params)
         else:
             cur.execute(sql)
+        
         if fetch:
             result = cur.fetchall()
         else:
@@ -55,11 +62,12 @@ def execute_sql(sql, params=None, fetch=False):
         conn.close()
 
 # ------------------------------------------------------------------
-# 数据库初始化（自动创建表）
+# 数据库初始化（自动创建表，加入缓存避免重复执行）
 # ------------------------------------------------------------------
-def init_db():
+@st.cache_resource
+def init_db_once():
     """创建所有必要表，兼容 PostgreSQL 和 SQLite"""
-    if SUPABASE_URL and SUPABASE_KEY:
+    if DB_URI:
         # PostgreSQL 建表语句
         statements = [
             """CREATE TABLE IF NOT EXISTS "user" (
@@ -114,7 +122,6 @@ def init_db():
             execute_sql(stmt)
     else:
         # SQLite 回退（本地使用）
-        import sqlite3
         conn = sqlite3.connect("health.db")
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS "user" (
@@ -167,7 +174,8 @@ def init_db():
         conn.commit()
         conn.close()
 
-init_db()
+# 触发数据库初始化
+init_db_once()
 
 # ------------------------------------------------------------------
 # API Key 本地持久化（可选）
@@ -204,7 +212,7 @@ def get_today_str():
 def get_daily_summary(date_str):
     """返回当天饮食总卡、运动消耗"""
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT SUM(calories) as total_cal FROM food_logs WHERE date = %s", (date_str,), fetch=True)
             total_cal = rows[0]['total_cal'] if rows and rows[0]['total_cal'] else 0
         else:
@@ -216,13 +224,14 @@ def get_daily_summary(date_str):
         total_cal = 0
 
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT intensity, SUM(duration_min) as total_min FROM exercise_logs WHERE date = %s GROUP BY intensity", (date_str,), fetch=True)
         else:
             conn = get_db()
             cur = conn.execute(f"SELECT intensity, SUM(duration_min) as total_min FROM exercise_logs WHERE date='{date_str}' GROUP BY intensity")
             rows = cur.fetchall()
             conn.close()
+        
         exercise_burn = 0
         for row in rows:
             intensity = row['intensity'] if isinstance(row, dict) else row[0]
@@ -293,7 +302,7 @@ def analyze_food_image(image_bytes, weight_kg, height_cm, age, gender):
 # ------------------------------------------------------------------
 def recommend_exercise(date_str, fatigue_score):
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT * FROM exercise_logs WHERE date = %s", (date_str,), fetch=True)
         else:
             conn = get_db()
@@ -302,8 +311,10 @@ def recommend_exercise(date_str, fatigue_score):
             conn.close()
     except:
         rows = []
+    
     if fatigue_score >= 4:
         return {"type": "rest", "message": "⚠️ 高疲劳状态：建议动态拉伸、筋膜放松、散步或直接全天休息。持续高疲劳会导致皮质醇上升，阻碍减脂。"}
+    
     muscle_map = {"背部": "胸部","胸部": "背部","腿部": "手臂","手臂": "腿部","肩膀": "背部","腹部": "背部","有氧": "力量训练"}
     if rows:
         last_type = rows[-1]['exercise_type'] if isinstance(rows[-1], dict) else rows[-1][2]
@@ -317,7 +328,7 @@ def recommend_exercise(date_str, fatigue_score):
 # ------------------------------------------------------------------
 def generate_motivation(date_str, fatigue_score, weight_trend):
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT date FROM daily_logs ORDER BY date DESC LIMIT 30", fetch=True)
             dates = [row['date'] for row in rows]
         else:
@@ -327,6 +338,7 @@ def generate_motivation(date_str, fatigue_score, weight_trend):
             conn.close()
     except:
         dates = []
+    
     streak = 0
     if dates:
         today_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -337,6 +349,7 @@ def generate_motivation(date_str, fatigue_score, weight_trend):
                 streak += 1
             else:
                 break
+                
     if fatigue_score >= 4:
         return "🛌 今天休息也是变强的一部分，去睡觉吧！"
     if streak >= 7:
@@ -348,44 +361,37 @@ def generate_motivation(date_str, fatigue_score, weight_trend):
     return "💪 每一天都在变得更好，哪怕只是一点点。"
 
 # ------------------------------------------------------------------
-# Streamlit UI
+# Streamlit UI & 布局样式
 # ------------------------------------------------------------------
-st.set_page_config(page_title="健康管理 · 数据导向", layout="wide")
 st.markdown("""
 <style>
     .reportview-container { background: #f5f5f5; }
-    .stButton>button { border-radius: 0; border: 1px solid #ccc; background: white; }
-    .stTextInput>input, .stNumberInput>input { border-radius: 0; border: 1px solid #ccc; }
+    .stButton>button { border-radius: 8px; border: 1px solid #ccc; background: white; width: 100%; }
+    .stTextInput>input, .stNumberInput>input { border-radius: 8px; border: 1px solid #ccc; }
     .stDataFrame { border: none; }
 </style>
 """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.title("个人健康管理")
-    page = st.radio("导航", ["📊 数据看板", "🍽️ 营养记录", "🏋️ 运动记录", "🤖 AI 教练", "⚙️ 设置"])
+# 处理 API Key
+env_key = os.getenv("DASHSCOPE_API_KEY", "")
+saved_key = load_api_key()
+default_key = env_key if env_key else saved_key
+if "dashscope_key" not in st.session_state:
+    st.session_state.dashscope_key = default_key
 
-    env_key = os.getenv("DASHSCOPE_API_KEY", "")
-    saved_key = load_api_key()
-    default_key = env_key if env_key else saved_key
-    if "dashscope_key" not in st.session_state:
-        st.session_state.dashscope_key = default_key
-    api_key = st.text_input("通义千问 API Key", value=st.session_state.dashscope_key, type="password")
-    if api_key:
-        st.session_state.dashscope_key = api_key
-        dashscope.api_key = api_key
-        if not env_key:
-            save_api_key(api_key)
-    elif env_key:
-        dashscope.api_key = env_key
-    else:
-        st.warning("未设置 API Key，通义千问功能将不可用。")
+# 设置全局 dashscope key
+if st.session_state.dashscope_key:
+    dashscope.api_key = st.session_state.dashscope_key
 
-# =============================== 页面内容 ===============================
+st.title("🏃‍♂️ 个人健康管理")
 
-if page == "📊 数据看板":
-    st.header("📊 数据看板")
+# 移动端友好的顶部标签页导航
+tab_kanban, tab_food, tab_exercise, tab_ai, tab_settings = st.tabs(["📊 看板", "🍽️ 饮食", "🏋️ 运动", "🤖 AI", "⚙️ 设置"])
+
+# =============================== 看板页 ===============================
+with tab_kanban:
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT date, weight_kg, fatigue_score FROM daily_logs ORDER BY date", fetch=True)
             df = pd.DataFrame(rows) if rows else pd.DataFrame()
         else:
@@ -396,7 +402,7 @@ if page == "📊 数据看板":
         df = pd.DataFrame()
 
     if df.empty:
-        st.info("还没有任何数据，请先在左侧菜单输入。")
+        st.info("还没有任何数据，请先在下方输入。")
     else:
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
@@ -410,36 +416,10 @@ if page == "📊 数据看板":
             yaxis2=dict(title='疲劳度', overlaying='y', side='right', range=[0, 6]),
             showlegend=True,
             hovermode='x unified',
-            template='plotly_white'
+            template='plotly_white',
+            margin=dict(l=0, r=0, t=30, b=0) # 适配手机屏幕
         )
-        st.plotly_chart(fig, width='stretch')
-
-        st.subheader("今日快速记录")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            today_weight = st.number_input("体重 (kg)", step=0.1, format="%.1f")
-        with col2:
-            today_fatigue = st.selectbox("主观疲劳度 (1-5)", [1,2,3,4,5], index=2)
-        with col3:
-            notes = st.text_area("备注（可选）", height=68, label_visibility="collapsed")
-
-        if st.button("保存今日记录"):
-            try:
-                if SUPABASE_URL and SUPABASE_KEY:
-                    execute_sql(
-                        "INSERT INTO daily_logs (date, weight_kg, fatigue_score, notes) VALUES (%s, %s, %s, %s) "
-                        "ON CONFLICT (date) DO UPDATE SET weight_kg=EXCLUDED.weight_kg, fatigue_score=EXCLUDED.fatigue_score, notes=EXCLUDED.notes",
-                        (get_today_str(), today_weight, today_fatigue, notes)
-                    )
-                else:
-                    conn = get_db()
-                    conn.execute("INSERT OR REPLACE INTO daily_logs (date, weight_kg, fatigue_score, notes) VALUES (?, ?, ?, ?)",
-                                 (get_today_str(), today_weight, today_fatigue, notes))
-                    conn.commit()
-                    conn.close()
-                st.success("保存成功！")
-            except Exception as e:
-                st.error(f"保存失败: {e}")
+        st.plotly_chart(fig, use_container_width=True)
 
         trend = "stable"
         if len(df) >= 2:
@@ -451,10 +431,37 @@ if page == "📊 数据看板":
         motivation = generate_motivation(get_today_str(), last_fatigue, trend)
         st.info(motivation)
 
-elif page == "🍽️ 营养记录":
-    st.header("🍽️ 营养记录")
+    st.subheader("今日快速打卡")
+    col1, col2 = st.columns(2)
+    with col1:
+        today_weight = st.number_input("体重 (kg)", step=0.1, format="%.1f")
+    with col2:
+        today_fatigue = st.selectbox("主观疲劳度 (1-5)", [1,2,3,4,5], index=2)
+    
+    notes = st.text_area("备注（可选）", height=68, label_visibility="collapsed")
+
+    if st.button("保存今日打卡"):
+        try:
+            if DB_URI:
+                execute_sql(
+                    "INSERT INTO daily_logs (date, weight_kg, fatigue_score, notes) VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (date) DO UPDATE SET weight_kg=EXCLUDED.weight_kg, fatigue_score=EXCLUDED.fatigue_score, notes=EXCLUDED.notes",
+                    (get_today_str(), today_weight, today_fatigue, notes)
+                )
+            else:
+                conn = get_db()
+                conn.execute("INSERT OR REPLACE INTO daily_logs (date, weight_kg, fatigue_score, notes) VALUES (?, ?, ?, ?)",
+                             (get_today_str(), today_weight, today_fatigue, notes))
+                conn.commit()
+                conn.close()
+            st.success("打卡成功！")
+        except Exception as e:
+            st.error(f"保存失败: {e}")
+
+# =============================== 饮食页 ===============================
+with tab_food:
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT * FROM \"user\" ORDER BY id DESC LIMIT 1", fetch=True)
             user = rows[0] if rows else None
         else:
@@ -465,167 +472,169 @@ elif page == "🍽️ 营养记录":
         user = None
 
     if not user:
-        st.warning("请先在 ⚙️ 设置 中输入身体数据。")
-        st.stop()
-
-    # 从用户数据中提取信息（兼容dict和tuple）
-    if isinstance(user, dict):
-        height_cm = user['height_cm']
-        weight_kg = user['weight_kg']
-        age = user['age']
-        gender = user['gender']
+        st.warning("请先在 ⚙️ 设置 页签中保存您的基础身体数据。")
     else:
-        height_cm = user[1]
-        weight_kg = user[2]
-        age = user[3]
-        gender = user[4]
+        # 从用户数据中提取信息（兼容dict和tuple）
+        if isinstance(user, dict):
+            height_cm = user['height_cm']
+            weight_kg = user['weight_kg']
+            age = user['age']
+            gender = user['gender']
+        else:
+            height_cm = user[1]
+            weight_kg = user[2]
+            age = user[3]
+            gender = user[4]
 
-    bmr = calculate_bmr(weight_kg, height_cm, age, gender)
-    st.markdown(f"**基础代谢 (BMR): {bmr:.0f} kcal**")
+        bmr = calculate_bmr(weight_kg, height_cm, age, gender)
+        st.markdown(f"**您的基础代谢 (BMR): {bmr:.0f} kcal**")
 
-    method = st.radio("记录方式", ["📝 文字描述", "📷 拍照/上传", "🍔 Cheat Meal"])
+        method = st.radio("记录方式", ["📝 文字描述", "📷 拍照/上传", "🍔 Cheat Meal"], horizontal=True)
 
-    if method == "📝 文字描述":
-        text = st.text_area("例如：1.2拳米饭，1拳油菜")
-        if st.button("分析文字"):
-            if not st.session_state.dashscope_key:
-                st.error("请先在侧边栏设置通义千问 API Key")
-            else:
-                result = analyze_food_text(text, weight_kg, height_cm, age, gender)
-                st.json(result)
-                try:
-                    data = json.loads(result)
-                    if SUPABASE_URL and SUPABASE_KEY:
-                        execute_sql(
-                            "INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                            (get_today_str(), "text_input", text, data.get('calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0))
-                        )
-                    else:
-                        conn = get_db()
-                        conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber) VALUES (?,?,?,?,?,?,?,?)",
-                                     (get_today_str(), "text_input", text, data.get('calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0)))
-                        conn.commit()
-                        conn.close()
-                    st.success("已保存到数据库")
-                except:
-                    st.warning("未能自动保存，请手动输入（见下方快速记录）")
+        if method == "📝 文字描述":
+            text = st.text_area("例如：1.2拳米饭，1拳油菜", height=80)
+            if st.button("AI 分析并记录"):
+                if not st.session_state.dashscope_key:
+                    st.error("请先在 ⚙️ 设置 页签设置通义千问 API Key")
+                else:
+                    with st.spinner("AI正在分析中..."):
+                        result = analyze_food_text(text, weight_kg, height_cm, age, gender)
+                        st.json(result)
+                        try:
+                            data = json.loads(result)
+                            if DB_URI:
+                                execute_sql(
+                                    "INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (get_today_str(), "text_input", text, data.get('calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0))
+                                )
+                            else:
+                                conn = get_db()
+                                conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber) VALUES (?,?,?,?,?,?,?,?)",
+                                             (get_today_str(), "text_input", text, data.get('calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0)))
+                                conn.commit()
+                                conn.close()
+                            st.success("已成功写入数据库")
+                        except:
+                            st.warning("JSON解析异常，未能自动入库")
 
-    elif method == "📷 拍照/上传":
-        uploaded = st.file_uploader("上传餐盘照片", type=['jpg','jpeg','png'])
-        if uploaded and st.button("分析照片"):
-            if not st.session_state.dashscope_key:
-                st.error("请先设置通义千问 API Key")
-            else:
-                img_bytes = uploaded.read()
-                result = analyze_food_image(img_bytes, weight_kg, height_cm, age, gender)
-                st.json(result)
-                try:
-                    data = json.loads(result)
-                    if SUPABASE_URL and SUPABASE_KEY:
-                        execute_sql(
-                            "INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber, image_path) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                            (get_today_str(), "vision", result, data.get('total_calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0), "uploaded_image")
-                        )
-                    else:
-                        conn = get_db()
-                        conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber, image_path) VALUES (?,?,?,?,?,?,?,?,?)",
-                                     (get_today_str(), "vision", result, data.get('total_calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0), "uploaded_image"))
-                        conn.commit()
-                        conn.close()
-                    st.success("已保存")
-                except:
-                    st.warning("解析JSON失败，请手动输入")
+        elif method == "📷 拍照/上传":
+            uploaded = st.file_uploader("上传餐盘照片", type=['jpg','jpeg','png'])
+            if uploaded and st.button("AI 视觉分析"):
+                if not st.session_state.dashscope_key:
+                    st.error("请先在 ⚙️ 设置 页签设置通义千问 API Key")
+                else:
+                    with st.spinner("AI看图中..."):
+                        img_bytes = uploaded.read()
+                        result = analyze_food_image(img_bytes, weight_kg, height_cm, age, gender)
+                        st.json(result)
+                        try:
+                            data = json.loads(result)
+                            if DB_URI:
+                                execute_sql(
+                                    "INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber, image_path) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (get_today_str(), "vision", result, data.get('total_calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0), "uploaded_image")
+                                )
+                            else:
+                                conn = get_db()
+                                conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, carbs, protein, fat, fiber, image_path) VALUES (?,?,?,?,?,?,?,?,?)",
+                                             (get_today_str(), "vision", result, data.get('total_calories',0), data.get('carbs',0), data.get('protein',0), data.get('fat',0), data.get('fiber',0), "uploaded_image"))
+                                conn.commit()
+                                conn.close()
+                            st.success("已成功写入数据库")
+                        except:
+                            st.warning("解析JSON失败，未能自动保存")
 
-    else:  # Cheat Meal
-        cheat_cal = st.number_input("估算总卡路里", step=50, value=500)
-        if st.button("记录 Cheat Meal"):
-            if SUPABASE_URL and SUPABASE_KEY:
-                execute_sql(
-                    "INSERT INTO food_logs (date, meal_type, food_description, calories, is_cheat_meal, cheat_calories) VALUES (%s,%s,%s,%s,%s,%s)",
-                    (get_today_str(), "cheat", "Cheat Meal", cheat_cal, 1, cheat_cal)
-                )
+        else:  # Cheat Meal
+            cheat_cal = st.number_input("估算总卡路里", step=50, value=500)
+            if st.button("记录 Cheat Meal"):
+                if DB_URI:
+                    execute_sql(
+                        "INSERT INTO food_logs (date, meal_type, food_description, calories, is_cheat_meal, cheat_calories) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (get_today_str(), "cheat", "Cheat Meal", cheat_cal, 1, cheat_cal)
+                    )
+                else:
+                    conn = get_db()
+                    conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, is_cheat_meal, cheat_calories) VALUES (?,?,?,?,?,?)",
+                                 (get_today_str(), "cheat", "Cheat Meal", cheat_cal, 1, cheat_cal))
+                    conn.commit()
+                    conn.close()
+                st.success("放纵餐已记录，偶尔放松是允许的！")
+
+        st.divider()
+        st.subheader("今日饮食汇总")
+        try:
+            if DB_URI:
+                rows = execute_sql("SELECT * FROM food_logs WHERE date = %s", (get_today_str(),), fetch=True)
+                today_food = pd.DataFrame(rows) if rows else pd.DataFrame()
             else:
                 conn = get_db()
-                conn.execute("INSERT INTO food_logs (date, meal_type, food_description, calories, is_cheat_meal, cheat_calories) VALUES (?,?,?,?,?,?)",
-                             (get_today_str(), "cheat", "Cheat Meal", cheat_cal, 1, cheat_cal))
-                conn.commit()
+                today_food = pd.read_sql_query(f"SELECT * FROM food_logs WHERE date='{get_today_str()}'", conn)
                 conn.close()
-            st.success("已记录放纵餐")
+        except:
+            today_food = pd.DataFrame()
 
-    st.subheader("今日饮食汇总")
-    try:
-        if SUPABASE_URL and SUPABASE_KEY:
-            rows = execute_sql("SELECT * FROM food_logs WHERE date = %s", (get_today_str(),), fetch=True)
-            today_food = pd.DataFrame(rows) if rows else pd.DataFrame()
+        if not today_food.empty:
+            total_cal = today_food['calories'].sum() if 'calories' in today_food else 0
+            st.metric("今日总摄入", f"{total_cal:.0f} kcal")
+            cols = ['meal_type','food_description','calories','carbs','protein','fat','fiber']
+            cols = [c for c in cols if c in today_food.columns]
+            st.dataframe(today_food[cols], use_container_width=True)
         else:
-            conn = get_db()
-            today_food = pd.read_sql_query(f"SELECT * FROM food_logs WHERE date='{get_today_str()}'", conn)
-            conn.close()
-    except:
-        today_food = pd.DataFrame()
+            st.info("今天还没有记录饮食")
 
-    if not today_food.empty:
-        total_cal = today_food['calories'].sum() if 'calories' in today_food else 0
-        st.write(f"总摄入：{total_cal:.0f} kcal")
-        cols = ['meal_type','food_description','calories','carbs','protein','fat','fiber']
-        cols = [c for c in cols if c in today_food.columns]
-        st.dataframe(today_food[cols], width='stretch')
-    else:
-        st.info("今天还没有记录")
+        # 明日饮食建议（用拳表示）
+        st.subheader("💡 饮食结构建议")
+        _, exercise_burn = get_daily_summary(get_today_str())
+        target_cal = bmr + exercise_burn * 0.5
+        recommended_protein = weight_kg * 2
+        recommended_fat = weight_kg * 0.8
+        recommended_carbs = weight_kg * 1
+        recommended_fiber = weight_kg * 0.04
 
-    # 明日饮食建议（用拳表示）
-    st.subheader("🍽️ 明日饮食建议")
-    _, exercise_burn = get_daily_summary(get_today_str())
-    target_cal = bmr + exercise_burn * 0.5
-    recommended_protein = weight_kg * 2
-    recommended_fat = weight_kg * 0.8
-    recommended_carbs = weight_kg * 1
-    recommended_fiber = weight_kg * 0.04
+        carbs_fists = grams_to_fists(recommended_carbs, "carbs")
+        protein_fists = grams_to_fists(recommended_protein, "protein")
+        fiber_fists = grams_to_fists(recommended_fiber, "fiber")
 
-    carbs_fists = grams_to_fists(recommended_carbs, "carbs")
-    protein_fists = grams_to_fists(recommended_protein, "protein")
-    fiber_fists = grams_to_fists(recommended_fiber, "fiber")
+        st.markdown(f"**目标总摄入**: {target_cal:.0f} kcal")
+        st.markdown(f"- 🍚 **碳水**: {carbs_fists}（{recommended_carbs:.0f}g）")
+        st.markdown(f"- 🥩 **蛋白质**: {protein_fists}（{recommended_protein:.0f}g）")
+        st.markdown(f"- 🥬 **纤维素**: {fiber_fists}（{recommended_fiber:.0f}g）")
 
-    st.markdown(f"**目标总摄入**: {target_cal:.0f} kcal")
-    st.markdown(f"- 🍚 碳水: {carbs_fists}（{recommended_carbs:.0f}g）")
-    st.markdown(f"- 🥩 蛋白质: {protein_fists}（{recommended_protein:.0f}g）")
-    st.markdown(f"- 🥬 纤维素: {fiber_fists}（{recommended_fiber:.0f}g）")
-    st.markdown(f"- 🧈 脂肪: {recommended_fat:.0f}g (≈{recommended_fat*9:.0f} kcal)")
+# =============================== 运动页 ===============================
+with tab_exercise:
+    ex_type = st.text_input("运动类型（如：背部、跑步）")
+    col1, col2 = st.columns(2)
+    with col1:
+        duration = st.number_input("时长 (分钟)", step=5, value=30)
+    with col2:
+        intensity = st.selectbox("疲劳度 (1轻松-5力竭)", [1,2,3,4,5], index=2)
+    
+    ex_notes = st.text_area("运动感受或备注", height=68)
+    
+    if st.button("保存运动记录"):
+        if not ex_type:
+            st.error("请输入运动类型")
+        else:
+            try:
+                if DB_URI:
+                    execute_sql(
+                        "INSERT INTO exercise_logs (date, exercise_type, duration_min, intensity, notes) VALUES (%s,%s,%s,%s,%s)",
+                        (get_today_str(), ex_type, duration, intensity, ex_notes)
+                    )
+                else:
+                    conn = get_db()
+                    conn.execute("INSERT INTO exercise_logs (date, exercise_type, duration_min, intensity, notes) VALUES (?,?,?,?,?)",
+                                 (get_today_str(), ex_type, duration, intensity, ex_notes))
+                    conn.commit()
+                    conn.close()
+                st.success("运动记录已保存")
+            except Exception as e:
+                st.error(f"保存失败: {e}")
 
-elif page == "🏋️ 运动记录":
-    st.header("🏋️ 运动记录")
-    with st.form("exercise_form"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            ex_type = st.text_input("运动类型（如：背部训练、跑步）", value="")
-        with col2:
-            duration = st.number_input("时长 (分钟)", step=5, value=30)
-        with col3:
-            intensity = st.selectbox("主观疲劳度 (1-5)", [1,2,3,4,5], index=2)
-        notes = st.text_area("备注", height=68)
-        submitted = st.form_submit_button("保存运动记录")
-        if submitted:
-            if not ex_type:
-                st.error("请输入运动类型")
-            else:
-                try:
-                    if SUPABASE_URL and SUPABASE_KEY:
-                        execute_sql(
-                            "INSERT INTO exercise_logs (date, exercise_type, duration_min, intensity, notes) VALUES (%s,%s,%s,%s,%s)",
-                            (get_today_str(), ex_type, duration, intensity, notes)
-                        )
-                    else:
-                        conn = get_db()
-                        conn.execute("INSERT INTO exercise_logs (date, exercise_type, duration_min, intensity, notes) VALUES (?,?,?,?,?)",
-                                     (get_today_str(), ex_type, duration, intensity, notes))
-                        conn.commit()
-                        conn.close()
-                    st.success("运动记录已保存")
-                except Exception as e:
-                    st.error(f"保存失败: {e}")
-
+    st.divider()
+    
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT * FROM exercise_logs WHERE date = %s", (get_today_str(),), fetch=True)
             today_ex = pd.DataFrame(rows) if rows else pd.DataFrame()
         else:
@@ -635,17 +644,17 @@ elif page == "🏋️ 运动记录":
     except:
         today_ex = pd.DataFrame()
 
-    st.subheader("今日运动")
+    st.subheader("今日运动清单")
     if not today_ex.empty:
         cols = ['exercise_type','duration_min','intensity','notes']
         cols = [c for c in cols if c in today_ex.columns]
-        st.dataframe(today_ex[cols], width='stretch')
+        st.dataframe(today_ex[cols], use_container_width=True)
     else:
-        st.info("还没有记录")
+        st.info("今天还没有流汗哦")
 
-    # 疲劳度获取
+    # 疲劳度获取与推荐
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT fatigue_score FROM daily_logs WHERE date = %s", (get_today_str(),), fetch=True)
             fatigue = rows[0]['fatigue_score'] if rows else 3
         else:
@@ -657,28 +666,15 @@ elif page == "🏋️ 运动记录":
         fatigue = 3
 
     rec = recommend_exercise(get_today_str(), fatigue)
-    st.subheader("📋 明日运动推荐")
+    st.subheader("📋 明日安排建议")
     st.info(rec['message'])
 
-    with st.expander("查看历史运动记录"):
-        try:
-            if SUPABASE_URL and SUPABASE_KEY:
-                rows = execute_sql("SELECT * FROM exercise_logs ORDER BY date DESC LIMIT 50", fetch=True)
-                df_ex_all = pd.DataFrame(rows) if rows else pd.DataFrame()
-            else:
-                conn = get_db()
-                df_ex_all = pd.read_sql_query("SELECT * FROM exercise_logs ORDER BY date DESC LIMIT 50", conn)
-                conn.close()
-        except:
-            df_ex_all = pd.DataFrame()
-        st.dataframe(df_ex_all, width='stretch')
-
-elif page == "🤖 AI 教练":
-    st.header("🤖 AI 教练")
+# =============================== AI 教练页 ===============================
+with tab_ai:
     today_str = get_today_str()
     # 取当日数据
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
+        if DB_URI:
             rows = execute_sql("SELECT weight_kg, fatigue_score FROM daily_logs WHERE date = %s", (today_str,), fetch=True)
             daily_info = rows[0] if rows else None
             weight = daily_info['weight_kg'] if daily_info else "未记录"
@@ -708,29 +704,34 @@ elif page == "🤖 AI 教练":
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    # 渲染历史对话
     for msg in st.session_state.chat_history[-10:]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("问你的运动/健康问题..."):
+    if prompt := st.chat_input("问教练关于饮食/训练的建议..."):
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
+            
         if not st.session_state.dashscope_key:
-            st.error("请先在侧边栏设置通义千问 API Key")
+            st.error("请先在 ⚙️ 设置 页签设置通义千问 API Key")
         else:
             messages = [
                 {"role": "system", "content": f"你是一个专业的健身教练与营养顾问。以下是用户的今日上下文：\n{context}\n请根据这些信息回答用户的问题，保持简洁、数据导向。"},
             ]
             for msg in st.session_state.chat_history[-6:]:
                 messages.append({"role": msg["role"], "content": msg["content"]})
-            response = call_llm(messages)
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+            
             with st.chat_message("assistant"):
-                st.markdown(response)
+                with st.spinner("教练思考中..."):
+                    response = call_llm(messages)
+                    st.markdown(response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-elif page == "⚙️ 设置":
-    st.header("⚙️ 设置")
+# =============================== 设置页 ===============================
+with tab_settings:
+    st.subheader("基础信息设置")
     with st.form("user_settings"):
         col1, col2 = st.columns(2)
         with col1:
@@ -739,10 +740,9 @@ elif page == "⚙️ 设置":
         with col2:
             age = st.number_input("年龄", step=1, value=30)
             gender = st.selectbox("性别", ["male", "female"])
-        if st.form_submit_button("保存设置"):
+        if st.form_submit_button("保存身体数据"):
             try:
-                if SUPABASE_URL and SUPABASE_KEY:
-                    # 检查是否已有记录
+                if DB_URI:
                     existing = execute_sql("SELECT id FROM \"user\" ORDER BY id DESC LIMIT 1", fetch=True)
                     if existing:
                         execute_sql("UPDATE \"user\" SET height_cm=%s, weight_kg=%s, age=%s, gender=%s WHERE id=%s",
@@ -759,23 +759,38 @@ elif page == "⚙️ 设置":
                         conn.execute("INSERT INTO \"user\" (height_cm, weight_kg, age, gender) VALUES (?,?,?,?)", (height, weight_input, age, gender))
                     conn.commit()
                     conn.close()
-                st.success("设置已保存")
+                st.success("数据已保存")
             except Exception as e:
                 st.error(f"保存失败: {e}")
 
-    st.subheader("数据管理")
-    if st.button("导出所有数据为 CSV"):
+    st.divider()
+    st.subheader("API 密钥配置")
+    api_key_input = st.text_input("通义千问 API Key", value=st.session_state.dashscope_key, type="password")
+    if st.button("保存 API Key"):
+        if api_key_input:
+            st.session_state.dashscope_key = api_key_input
+            dashscope.api_key = api_key_input
+            if not env_key:
+                save_api_key(api_key_input)
+            st.success("API Key 更新成功")
+        else:
+            st.warning("请输入有效的 Key")
+
+    st.divider()
+    st.subheader("数据导出")
+    if st.button("导出所有云端数据"):
         try:
             tables = ['daily_logs', 'food_logs', 'exercise_logs']
             for table in tables:
-                if SUPABASE_URL and SUPABASE_KEY:
+                if DB_URI:
                     rows = execute_sql(f"SELECT * FROM {table}", fetch=True)
-                    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+                    df_export = pd.DataFrame(rows) if rows else pd.DataFrame()
                 else:
                     conn = get_db()
-                    df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+                    df_export = pd.read_sql_query(f"SELECT * FROM {table}", conn)
                     conn.close()
-                csv_data = df.to_csv(index=False)
-                st.download_button(label=f"下载 {table}.csv", data=csv_data, file_name=f"{table}.csv", mime="text/csv")
+                if not df_export.empty:
+                    csv_data = df_export.to_csv(index=False).encode('utf-8')
+                    st.download_button(label=f"下载 {table}.csv", data=csv_data, file_name=f"{table}.csv", mime="text/csv")
         except Exception as e:
             st.error(f"导出失败: {e}")
